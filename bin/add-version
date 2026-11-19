@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Add or bump a Ruby version in versions.json.
+#
+#   bin/add-version 4.0.11
+#
+# Looks up the SHA-256 of the .tar.xz tarball in ruby-lang.org's release index
+# and sets it as the current release for that minor version (e.g. "4.0").
+set -euo pipefail
+
+version="${1:?usage: bin/add-version X.Y.Z}"
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "error: expected a version like 4.0.11" >&2; exit 1; }
+minor="${version%.*}"
+cd "$(dirname "$0")/.."
+
+sha256="$(curl -fsSL https://cache.ruby-lang.org/pub/ruby/index.txt \
+  | awk -v name="ruby-$version" -F'\t' '$1 == name && $2 ~ /\.tar\.xz$/ { print $4 }')"
+[ -n "$sha256" ] || { echo "error: ruby-$version.tar.xz not found in https://cache.ruby-lang.org/pub/ruby/index.txt" >&2; exit 1; }
+
+tmp="$(mktemp)"
+jq --indent 2 --arg minor "$minor" --arg version "$version" --arg sha256 "$sha256" \
+  '.[$minor] = {version: $version, sha256: $sha256} | to_entries | sort_by(.key | split(".") | map(tonumber)) | from_entries' \
+  versions.json > "$tmp"
+mv "$tmp" versions.json
+
+echo "$minor -> $version ($sha256)"
+echo "Check the checksum against https://www.ruby-lang.org/en/downloads/releases/ before merging."

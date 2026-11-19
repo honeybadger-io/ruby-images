@@ -1,0 +1,170 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly rebuild to pick up Debian security fixes in the base images.
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/honeybadger-io/ruby
+  SOURCE_URL: https://github.com/${{ github.repository }}
+  # Only publish from main. Pull requests build and test without pushing.
+  PUBLISH: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
+
+jobs:
+  versions:
+    runs-on: ubuntu-latest
+    outputs:
+      rubies: ${{ steps.read.outputs.rubies }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: read
+        run: |
+          echo "rubies=$(jq -c '[to_entries[] | {minor: .key} + .value]' versions.json)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: versions
+    name: ${{ matrix.ruby.version }}${{ matrix.variant.suffix }} (${{ matrix.platform.arch }})
+    runs-on: ${{ matrix.platform.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        ruby: ${{ fromJSON(needs.versions.outputs.rubies) }}
+        variant:
+          - { dir: trixie, suffix: "" }
+          - { dir: slim-trixie, suffix: "-slim" }
+        # Native runners for each CPU type: compiling Ruby under QEMU is very slow.
+        platform:
+          - { arch: amd64, runner: ubuntu-latest }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      # No layer cache across runs: every build pulls the current base image and
+      # Debian packages, which is the point of the scheduled rebuild.
+      - name: Build
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.variant.dir }}
+          platforms: linux/${{ matrix.platform.arch }}
+          pull: true
+          load: true
+          tags: ruby-images-test
+          build-args: |
+            RUBY_VERSION=${{ matrix.ruby.version }}
+            RUBY_DOWNLOAD_SHA256=${{ matrix.ruby.sha256 }}
+
+      - name: Verify
+        run: bin/verify ruby-images-test "${{ matrix.ruby.version }}"
+
+      - name: Log in to GHCR
+        if: env.PUBLISH == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Same inputs as the Build step, so this reuses the builder's layers and
+      # only pushes. The image is pushed by digest; the publish job tags it.
+      - name: Push by digest
+        id: push
+        if: env.PUBLISH == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.variant.dir }}
+          platforms: linux/${{ matrix.platform.arch }}
+          build-args: |
+            RUBY_VERSION=${{ matrix.ruby.version }}
+            RUBY_DOWNLOAD_SHA256=${{ matrix.ruby.sha256 }}
+          labels: |
+            org.opencontainers.image.source=${{ env.SOURCE_URL }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ matrix.ruby.version }}${{ matrix.variant.suffix }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Save digest
+        if: env.PUBLISH == 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+
+      - uses: actions/upload-artifact@v7
+        if: env.PUBLISH == 'true'
+        with:
+          name: digests-${{ matrix.ruby.minor }}-${{ matrix.variant.dir }}-${{ matrix.platform.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [versions, build]
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    name: Publish ${{ matrix.ruby.version }}${{ matrix.variant.suffix }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        ruby: ${{ fromJSON(needs.versions.outputs.rubies) }}
+        variant:
+          - { dir: trixie, suffix: "" }
+          - { dir: slim-trixie, suffix: "-slim" }
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: digests-${{ matrix.ruby.minor }}-${{ matrix.variant.dir }}-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Tags: <version><suffix> (e.g. 4.0.10-slim) and the floating <minor><suffix>
+      # (e.g. 4.0-slim). versions.json holds one release per minor, so the minor
+      # tag always points at the newest patch release.
+      - name: Create multi-arch manifest
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          count=$(ls | wc -l)
+          [ "$count" -eq 2 ] || { echo "expected 2 digests (amd64, arm64), found $count"; exit 1; }
+          docker buildx imagetools create \
+            --annotation "index:org.opencontainers.image.source=$SOURCE_URL" \
+            --annotation "index:org.opencontainers.image.revision=$GITHUB_SHA" \
+            --annotation "index:org.opencontainers.image.description=Ruby $VERSION ($VARIANT) with jemalloc and YJIT" \
+            -t "$IMAGE:$VERSION$SUFFIX" \
+            -t "$IMAGE:$MINOR$SUFFIX" \
+            $(printf "$IMAGE@sha256:%s " *)
+        env:
+          VERSION: ${{ matrix.ruby.version }}
+          MINOR: ${{ matrix.ruby.minor }}
+          SUFFIX: ${{ matrix.variant.suffix }}
+          VARIANT: ${{ matrix.variant.dir }}
+
+      - name: Inspect
+        run: docker buildx imagetools inspect "$IMAGE:${{ matrix.ruby.version }}${{ matrix.variant.suffix }}"

@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Check that a built image runs the expected Ruby, linked against jemalloc, with YJIT.
+#
+#   bin/verify IMAGE EXPECTED_RUBY_VERSION
+set -euo pipefail
+
+image="${1:?usage: bin/verify IMAGE EXPECTED_RUBY_VERSION}"
+expected="${2:?usage: bin/verify IMAGE EXPECTED_RUBY_VERSION}"
+failed=0
+
+ruby() { docker run --rm "$image" ruby "$@"; }
+check() {
+  local name="$1" ok="$2" detail="$3"
+  if [ "$ok" = 1 ]; then echo "ok   $name: $detail"; else echo "FAIL $name: $detail"; failed=1; fi
+}
+
+description="$(ruby -v)"
+version="$(ruby -e 'print RUBY_VERSION')"
+check "version" "$([ "$version" = "$expected" ] && echo 1)" "$description"
+
+mainlibs="$(ruby -e 'p RbConfig::CONFIG["MAINLIBS"]')"
+check "jemalloc linked" "$([[ "$mainlibs" == *jemalloc* ]] && echo 1)" "MAINLIBS=$mainlibs"
+
+# Linked is not the same as loaded: make sure the process actually maps libjemalloc.
+loaded="$(ruby -e 'print File.read("/proc/self/maps")[/\S*libjemalloc\S*/].to_s')"
+check "jemalloc loaded" "$([ -n "$loaded" ] && echo 1)" "${loaded:-not mapped}"
+
+yjit="$(ruby --yjit -e 'p RubyVM::YJIT.enabled?')"
+check "yjit" "$([ "$yjit" = true ] && echo 1)" "RubyVM::YJIT.enabled?=$yjit"
+
+stdlib="$(ruby -ropenssl -rpsych -rzlib -e 'print OpenSSL::OPENSSL_LIBRARY_VERSION' 2>&1 || true)"
+check "openssl/psych/zlib" "$([[ "$stdlib" == OpenSSL* ]] && echo 1)" "$stdlib"
+
+exit "$failed"
